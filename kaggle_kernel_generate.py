@@ -1,6 +1,6 @@
 """
 kaggle_kernel_generate.py
-Runs INSIDE a Kaggle Notebook (GPU: T4 x1 recommended).
+Runs INSIDE a Kaggle Notebook (GPU: T4 x2 recommended - NOT P100, see README).
 Generates a ~60s mythological video: Lord Krishna + a baby, from one text prompt.
 
 Pipeline:
@@ -9,23 +9,30 @@ Pipeline:
   3. Split the user prompt into N scenes.
   4. For each scene, generate a 6-10s clip with CogVideoX-5B-I2V, conditioned
      on the reference images so characters stay visually consistent.
-  5. Generate narration audio with Coqui XTTS-v2 (voice tweaked via speed/pitch).
+  5. Generate narration audio with a transformers-native TTS model (facebook/mms-tts-eng),
+     with a pitch/speed shift applied afterward for a distinct voice.
   6. Stitch everything with ffmpeg into output.mp4 (Kaggle kernel output).
 
-Kaggle settings required:
-  - Accelerator: GPU T4 x1
-  - Internet: ON (requires phone verification on your Kaggle account)
-  - Add this as a "Script" kernel so it can run headless via `kaggle kernels push`.
+IMPORTANT Kaggle settings required (set manually in the Kaggle web UI, not via API):
+  - Open this kernel in the Kaggle editor, open session settings, and set
+    Accelerator = "GPU T4 x2". Do NOT use "GPU P100" - Kaggle's current
+    default PyTorch build has dropped support for the P100's older
+    CUDA compute capability (sm_60), causing GPU init to fail.
+  - Internet: ON (requires phone verification on your Kaggle account).
+  - Kernel type: "Script", so it runs headless via `kaggle kernels push`.
 
 Notes on T4 (16GB VRAM) memory management:
   - Uses float16 (not bfloat16) - T4 is a Turing GPU without proper bf16 tensor core support.
   - Uses enable_model_cpu_offload() + enable_attention_slicing() + vae slicing/tiling on
-    BOTH pipelines so no single pipeline tries to hold its full weights on GPU at once.
+    BOTH diffusion pipelines so no single pipeline tries to hold its full weights on GPU at once.
 
-Note on the TTS package:
-  - The original PyPI package "TTS" (Coqui) is abandoned and capped at Python <3.12.
-  - Kaggle's current image runs Python 3.12, so we install the maintained fork
-    "coqui-tts" instead. It keeps the same `from TTS.api import TTS` import path.
+Note on TTS engine:
+  - We intentionally do NOT use the separate "TTS"/"coqui-tts" packages. Their internal
+    code depends on specific transformers internals that conflict with the newer
+    transformers version diffusers/CogVideoX requires (import errors like
+    "cannot import name isin_mps_friendly"). Using transformers' own TTS pipeline
+    (facebook/mms-tts-eng) avoids that whole class of dependency conflicts since it
+    shares the same transformers install as the video pipeline.
 """
 
 import subprocess
@@ -35,7 +42,7 @@ print("Installing/upgrading required packages...")
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q", "-U",
      "diffusers>=0.31.0", "transformers>=4.44.0", "accelerate>=0.33.0",
-     "coqui-tts", "imageio-ffmpeg", "sentencepiece", "protobuf"],
+     "imageio-ffmpeg", "sentencepiece", "protobuf", "scipy"],
     check=True
 )
 
@@ -45,9 +52,10 @@ import traceback
 import gc
 
 import torch
+import scipy.io.wavfile
 from diffusers import FluxPipeline, CogVideoXImageToVideoPipeline
 from diffusers.utils import export_to_video, load_image
-from TTS.api import TTS
+from transformers import pipeline as hf_pipeline
 
 PROMPT = os.environ.get(
     "SCENE_PROMPT",
@@ -85,11 +93,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     if device == "cpu":
-        print("WARNING: No GPU detected. Enable GPU T4 x1 in Kaggle kernel settings (Settings > Accelerator).")
+        print("WARNING: No GPU detected. Enable GPU T4 x2 in Kaggle kernel session settings.")
         raise RuntimeError("No GPU available - this pipeline requires a GPU kernel.")
 
+    gpu_name = torch.cuda.get_device_name(0)
     total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-    print(f"GPU: {torch.cuda.get_device_name(0)}, VRAM: {total_vram:.1f} GB")
+    print(f"GPU: {gpu_name}, VRAM: {total_vram:.1f} GB")
+    if "P100" in gpu_name:
+        raise RuntimeError(
+            "This kernel is running on a P100, which is incompatible with the current "
+            "PyTorch build (dropped sm_60 support). Open this kernel in the Kaggle "
+            "editor and switch Accelerator to 'GPU T4 x2' in session settings, then re-run."
+        )
 
     print("Loading FLUX.1-schnell for reference images (memory-optimized)...")
     flux = FluxPipeline.from_pretrained(
@@ -156,29 +171,29 @@ def main():
     del video_pipe
     free_gpu()
 
-    print("Loading XTTS-v2 for narration...")
-    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+    print("Loading transformers TTS pipeline (facebook/mms-tts-eng)...")
+    tts_pipe = hf_pipeline("text-to-speech", model="facebook/mms-tts-eng", device=0)
 
     narration_text = (
         f"{PROMPT}. In the gentle glow of dusk, the divine and the innocent came together, "
         "a moment of pure devotion and joy."
     )
     narration_path = f"{WORKDIR}/narration.wav"
-    tts.tts_to_file(
-        text=narration_text,
-        speaker_wav=None,
-        language="en",
-        file_path=narration_path,
-        speed=0.95,
+    tts_output = tts_pipe(narration_text)
+    scipy.io.wavfile.write(
+        narration_path,
+        rate=tts_output["sampling_rate"],
+        data=tts_output["audio"][0]
     )
 
-    del tts
+    del tts_pipe
     free_gpu()
 
+    # Pitch/speed shift for a distinct narration voice
     shifted_narration = f"{WORKDIR}/narration_shifted.wav"
     subprocess.run([
         "ffmpeg", "-y", "-i", narration_path,
-        "-af", "asetrate=44100*0.97,aresample=44100,atempo=1.03",
+        "-af", "asetrate=44100*0.95,aresample=44100,atempo=1.05",
         shifted_narration
     ], check=True)
 
