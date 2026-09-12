@@ -1,11 +1,11 @@
 """
 kaggle_kernel_generate.py
-Runs INSIDE a Kaggle Notebook (GPU: T4 x1 or P100 recommended).
+Runs INSIDE a Kaggle Notebook (GPU: T4 x1 recommended).
 Generates a ~60s mythological video: Lord Krishna + a baby, from one text prompt.
 
 Pipeline:
   1. Install/upgrade required packages (Kaggle's base image is often outdated/missing them).
-  2. Generate two reference images (Krishna, baby) with FLUX.1-schnell.
+  2. Generate two reference images (Krishna, baby) with FLUX.1-schnell (memory-optimized for T4 16GB).
   3. Split the user prompt into N scenes.
   4. For each scene, generate a 6-10s clip with CogVideoX-5B-I2V, conditioned
      on the reference images so characters stay visually consistent.
@@ -13,9 +13,14 @@ Pipeline:
   6. Stitch everything with ffmpeg into output.mp4 (Kaggle kernel output).
 
 Kaggle settings required:
-  - Accelerator: GPU T4 x1 (or P100)
+  - Accelerator: GPU T4 x1
   - Internet: ON (to download model weights and pip packages)
   - Add this as a "Script" kernel so it can run headless via `kaggle kernels push`.
+
+Notes on T4 (16GB VRAM) memory management:
+  - Uses float16 (not bfloat16) - T4 is a Turing GPU without proper bf16 tensor core support.
+  - Uses enable_model_cpu_offload() + enable_attention_slicing() + vae slicing/tiling on
+    BOTH pipelines so no single pipeline tries to hold its full weights on GPU at once.
 """
 
 import subprocess
@@ -32,6 +37,7 @@ subprocess.run(
 import os
 import json
 import traceback
+import gc
 
 import torch
 from diffusers import FluxPipeline, CogVideoXImageToVideoPipeline
@@ -47,6 +53,14 @@ CLIP_SECONDS = 10
 FPS = 8
 WORKDIR = "/kaggle/working"
 os.makedirs(WORKDIR, exist_ok=True)
+
+DTYPE = torch.float16  # T4-safe dtype
+
+
+def free_gpu():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 
 def split_into_scenes(prompt: str, n: int) -> list:
@@ -66,12 +80,20 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     if device == "cpu":
-        print("WARNING: No GPU detected. Enable GPU T4 x1 in Kaggle kernel settings.")
+        print("WARNING: No GPU detected. Enable GPU T4 x1 in Kaggle kernel settings (Settings > Accelerator).")
+        raise RuntimeError("No GPU available - this pipeline requires a GPU kernel.")
 
-    print("Loading FLUX.1-schnell for reference images...")
+    total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    print(f"GPU: {torch.cuda.get_device_name(0)}, VRAM: {total_vram:.1f} GB")
+
+    print("Loading FLUX.1-schnell for reference images (memory-optimized)...")
     flux = FluxPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16
-    ).to(device)
+        "black-forest-labs/FLUX.1-schnell", torch_dtype=DTYPE
+    )
+    flux.enable_model_cpu_offload()
+    flux.enable_attention_slicing()
+    flux.vae.enable_slicing()
+    flux.vae.enable_tiling()
 
     krishna_ref_path = f"{WORKDIR}/krishna_ref.png"
     baby_ref_path = f"{WORKDIR}/baby_ref.png"
@@ -80,7 +102,8 @@ def main():
         "Lord Krishna, blue-skinned deity, peacock feather crown, yellow silk dhoti, "
         "playing a flute, serene expression, soft divine lighting, front-facing portrait, "
         "highly detailed digital painting style",
-        num_inference_steps=4, guidance_scale=0.0
+        num_inference_steps=4, guidance_scale=0.0,
+        height=512, width=512,
     ).images[0]
     krishna_img.save(krishna_ref_path)
 
@@ -88,21 +111,24 @@ def main():
         "A happy chubby baby, warm golden lighting, sitting pose, front-facing portrait, "
         "soft skin texture, wearing simple traditional Indian baby clothes, "
         "highly detailed digital painting style",
-        num_inference_steps=4, guidance_scale=0.0
+        num_inference_steps=4, guidance_scale=0.0,
+        height=512, width=512,
     ).images[0]
     baby_img.save(baby_ref_path)
 
     del flux
-    torch.cuda.empty_cache()
+    free_gpu()
 
     scenes = split_into_scenes(PROMPT, NUM_SCENES)
     print("Scenes:", json.dumps(scenes, indent=2))
 
-    print("Loading CogVideoX-5B-I2V...")
+    print("Loading CogVideoX-5B-I2V (memory-optimized)...")
     video_pipe = CogVideoXImageToVideoPipeline.from_pretrained(
-        "THUDM/CogVideoX-5b-I2V", torch_dtype=torch.bfloat16
-    ).to(device)
+        "THUDM/CogVideoX-5b-I2V", torch_dtype=DTYPE
+    )
     video_pipe.enable_model_cpu_offload()
+    video_pipe.enable_attention_slicing()
+    video_pipe.vae.enable_slicing()
     video_pipe.vae.enable_tiling()
 
     clip_paths = []
@@ -113,16 +139,17 @@ def main():
             prompt=scene_prompt,
             image=ref_image,
             num_videos_per_prompt=1,
-            num_inference_steps=30,
+            num_inference_steps=25,
             num_frames=CLIP_SECONDS * FPS,
             guidance_scale=6.0,
         ).frames[0]
         clip_path = f"{WORKDIR}/scene_{i:02d}.mp4"
         export_to_video(frames, clip_path, fps=FPS)
         clip_paths.append(clip_path)
+        free_gpu()
 
     del video_pipe
-    torch.cuda.empty_cache()
+    free_gpu()
 
     print("Loading XTTS-v2 for narration...")
     tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
@@ -139,6 +166,9 @@ def main():
         file_path=narration_path,
         speed=0.95,
     )
+
+    del tts
+    free_gpu()
 
     shifted_narration = f"{WORKDIR}/narration_shifted.wav"
     subprocess.run([
