@@ -10,8 +10,10 @@ Pipeline:
   4. For each scene, animate a reference image into a ~4s clip with Stable Video Diffusion
      (img2vid-xt), alternating between the Krishna and baby reference images so both
      characters stay visually consistent across the whole video.
-  5. Generate narration audio with a transformers-native TTS model (facebook/mms-tts-eng),
-     with a pitch/speed shift applied afterward for a distinct voice.
+  5. Generate narration audio directly with the VitsModel (facebook/mms-tts-eng), bypassing
+     transformers' generic "text-to-speech" pipeline wrapper (it has a bug calling
+     `.to(dtype=...)` on a BatchEncoding object), with a pitch/speed shift applied
+     afterward for a distinct voice.
   6. Stitch everything with ffmpeg into output.mp4 (Kaggle kernel output).
 
 Kaggle settings required:
@@ -20,14 +22,17 @@ Kaggle settings required:
   - Kernel type: "Script", so it runs headless via `kaggle kernels push`.
 
 IMPORTANT - why CogVideoX-5B was replaced with Stable Video Diffusion:
-  CogVideoX-5B-I2V ships a 4.7B-parameter T5-XXL text encoder plus a 5B video transformer.
-  Even with fp16 weights and low_cpu_mem_usage, loading its checkpoint shards into host
-  RAM before GPU offload consistently exceeded Kaggle's free-tier ~13GB RAM limit and got
-  the process OS-killed (twice, confirmed via logs, including after the fp16 variant
-  request silently fell back to full-size weights since no fp16 variant is published for
-  that repo). Stable Video Diffusion (img2vid-xt) is roughly 8x smaller, is natively an
-  image-to-video model (a natural fit for animating our reference images), and is one of
-  the most widely used models specifically proven to run on free Kaggle T4 kernels.
+  CogVideoX-5B-I2V's text encoder + transformer consistently exceeded Kaggle's free-tier
+  ~13GB host RAM during checkpoint loading and got OS-killed. Stable Video Diffusion
+  (img2vid-xt) is roughly 8x smaller, is natively an image-to-video model, and is proven
+  to run reliably on free Kaggle T4 kernels (confirmed: all 15 scenes generated cleanly
+  in the prior run).
+
+Note on TTS:
+  - transformers' pipeline("text-to-speech", model="facebook/mms-tts-eng") has a known bug:
+    it calls `.to(dtype=...)` on a BatchEncoding object during preprocessing, which raises
+    "TypeError: BatchEncoding.to() got an unexpected keyword argument 'dtype'". We avoid it
+    entirely by loading VitsModel + AutoTokenizer directly and running inference manually.
 
 Notes on T4 (16GB VRAM) memory management:
   - Uses float16 (not bfloat16) - T4 is a Turing GPU without proper bf16 tensor core support.
@@ -35,16 +40,8 @@ Notes on T4 (16GB VRAM) memory management:
     weights on GPU at once.
 
 Note on image model:
-  - FLUX.1-schnell became a gated Hugging Face model (requires login + accepted license),
-    which would need an extra manual HF token setup step. We use "stabilityai/sdxl-turbo"
-    instead - fully open, no login required, and lighter on VRAM.
-
-Note on TTS engine:
-  - We intentionally do NOT use the separate "TTS"/"coqui-tts" packages. Their internal
-    code depends on specific transformers internals that conflict with the newer
-    transformers version diffusers requires (import errors like
-    "cannot import name isin_mps_friendly"). Using transformers' own TTS pipeline
-    (facebook/mms-tts-eng) avoids that whole class of dependency conflicts.
+  - FLUX.1-schnell became a gated Hugging Face model (requires login + accepted license).
+    We use "stabilityai/sdxl-turbo" instead - fully open, no login required.
 """
 
 import subprocess
@@ -67,7 +64,7 @@ import torch
 import scipy.io.wavfile
 from diffusers import AutoPipelineForText2Image, StableVideoDiffusionPipeline
 from diffusers.utils import export_to_video, load_image
-from transformers import pipeline as hf_pipeline
+from transformers import VitsModel, AutoTokenizer
 
 PROMPT = os.environ.get(
     "SCENE_PROMPT",
@@ -165,22 +162,26 @@ def main():
     free_gpu()
     gc.collect()
 
-    print("Loading transformers TTS pipeline (facebook/mms-tts-eng)...")
-    tts_pipe = hf_pipeline("text-to-speech", model="facebook/mms-tts-eng", device=0)
+    print("Loading VitsModel directly for narration (bypassing buggy TTS pipeline wrapper)...")
+    tts_model = VitsModel.from_pretrained("facebook/mms-tts-eng").to(device)
+    tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
 
     narration_text = (
         f"{PROMPT}. In the gentle glow of dusk, the divine and the innocent came together, "
         "a moment of pure devotion and joy."
     )
+    tts_inputs = tts_tokenizer(narration_text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        waveform = tts_model(**tts_inputs).waveform
+
     narration_path = f"{WORKDIR}/narration.wav"
-    tts_output = tts_pipe(narration_text)
     scipy.io.wavfile.write(
         narration_path,
-        rate=tts_output["sampling_rate"],
-        data=tts_output["audio"][0]
+        rate=tts_model.config.sampling_rate,
+        data=waveform.float().cpu().numpy().squeeze()
     )
 
-    del tts_pipe
+    del tts_model, tts_tokenizer
     free_gpu()
 
     shifted_narration = f"{WORKDIR}/narration_shifted.wav"
