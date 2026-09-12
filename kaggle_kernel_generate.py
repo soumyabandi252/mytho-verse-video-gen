@@ -23,6 +23,14 @@ Notes on T4 (16GB VRAM) memory management:
   - Uses enable_model_cpu_offload() + enable_attention_slicing() + vae slicing/tiling on
     BOTH diffusion pipelines so no single pipeline tries to hold its full weights on GPU at once.
 
+Notes on HOST RAM (not VRAM) for CogVideoX:
+  - CogVideoX-5b-I2V ships a 4.7B-parameter T5-XXL text encoder plus a 5B transformer.
+    Loading these at default (often fp32-stored) precision into CPU RAM before any GPU
+    offload happens can exceed Kaggle's ~13GB host RAM limit, causing the OS to kill the
+    process ("Killed" in logs, not a Python traceback). We fix this by requesting the
+    "fp16" variant explicitly (half the memory footprint) with a safe fallback to default
+    weights if that variant isn't published for this repo, and by using low_cpu_mem_usage.
+
 Note on image model:
   - FLUX.1-schnell became a gated Hugging Face model (requires login + accepted license),
     which would need an extra manual HF token setup step. We use "stabilityai/sdxl-turbo"
@@ -78,6 +86,22 @@ def free_gpu():
     torch.cuda.ipc_collect()
 
 
+def load_cogvideox_low_ram():
+    """Load CogVideoX-5b-I2V with the smallest possible host-RAM footprint.
+    Tries the fp16 variant first (half the RAM/disk of default weights);
+    falls back to default weights if that variant isn't published."""
+    common_kwargs = dict(torch_dtype=DTYPE, low_cpu_mem_usage=True, use_safetensors=True)
+    try:
+        return CogVideoXImageToVideoPipeline.from_pretrained(
+            "THUDM/CogVideoX-5b-I2V", variant="fp16", **common_kwargs
+        )
+    except Exception as e:
+        print(f"fp16 variant unavailable ({e}); falling back to default weights.")
+        return CogVideoXImageToVideoPipeline.from_pretrained(
+            "THUDM/CogVideoX-5b-I2V", **common_kwargs
+        )
+
+
 def split_into_scenes(prompt: str, n: int) -> list:
     base = prompt.strip().rstrip(".")
     beats = [
@@ -109,7 +133,7 @@ def main():
 
     print("Loading SDXL-Turbo for reference images (open, ungated, memory-optimized)...")
     img_pipe = AutoPipelineForText2Image.from_pretrained(
-        "stabilityai/sdxl-turbo", torch_dtype=DTYPE, variant="fp16"
+        "stabilityai/sdxl-turbo", torch_dtype=DTYPE, variant="fp16", low_cpu_mem_usage=True
     )
     img_pipe.enable_model_cpu_offload()
     img_pipe.enable_attention_slicing()
@@ -139,14 +163,13 @@ def main():
 
     del img_pipe
     free_gpu()
+    gc.collect()
 
     scenes = split_into_scenes(PROMPT, NUM_SCENES)
     print("Scenes:", json.dumps(scenes, indent=2))
 
-    print("Loading CogVideoX-5B-I2V (memory-optimized)...")
-    video_pipe = CogVideoXImageToVideoPipeline.from_pretrained(
-        "THUDM/CogVideoX-5b-I2V", torch_dtype=DTYPE
-    )
+    print("Loading CogVideoX-5B-I2V (low host-RAM mode)...")
+    video_pipe = load_cogvideox_low_ram()
     video_pipe.enable_model_cpu_offload()
     video_pipe.enable_attention_slicing()
     video_pipe.vae.enable_slicing()
@@ -171,6 +194,7 @@ def main():
 
     del video_pipe
     free_gpu()
+    gc.collect()
 
     print("Loading transformers TTS pipeline (facebook/mms-tts-eng)...")
     tts_pipe = hf_pipeline("text-to-speech", model="facebook/mms-tts-eng", device=0)
