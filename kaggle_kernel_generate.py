@@ -1,11 +1,11 @@
 """
 kaggle_kernel_generate.py
-Runs INSIDE a Kaggle Notebook (GPU: T4 x2 recommended - NOT P100, see README).
+Runs INSIDE a Kaggle Notebook (GPU: T4 x2, forced via orchestrator.py's machine_shape).
 Generates a ~60s mythological video: Lord Krishna + a baby, from one text prompt.
 
 Pipeline:
   1. Install/upgrade required packages (Kaggle's base image is often outdated/missing them).
-  2. Generate two reference images (Krishna, baby) with FLUX.1-schnell (memory-optimized for T4 16GB).
+  2. Generate two reference images (Krishna, baby) with SDXL-Turbo (open, ungated, T4-light).
   3. Split the user prompt into N scenes.
   4. For each scene, generate a 6-10s clip with CogVideoX-5B-I2V, conditioned
      on the reference images so characters stay visually consistent.
@@ -13,11 +13,8 @@ Pipeline:
      with a pitch/speed shift applied afterward for a distinct voice.
   6. Stitch everything with ffmpeg into output.mp4 (Kaggle kernel output).
 
-IMPORTANT Kaggle settings required (set manually in the Kaggle web UI, not via API):
-  - Open this kernel in the Kaggle editor, open session settings, and set
-    Accelerator = "GPU T4 x2". Do NOT use "GPU P100" - Kaggle's current
-    default PyTorch build has dropped support for the P100's older
-    CUDA compute capability (sm_60), causing GPU init to fail.
+Kaggle settings required:
+  - GPU type is forced to T4 via "machine_shape" in orchestrator.py's kernel-metadata.json.
   - Internet: ON (requires phone verification on your Kaggle account).
   - Kernel type: "Script", so it runs headless via `kaggle kernels push`.
 
@@ -25,6 +22,11 @@ Notes on T4 (16GB VRAM) memory management:
   - Uses float16 (not bfloat16) - T4 is a Turing GPU without proper bf16 tensor core support.
   - Uses enable_model_cpu_offload() + enable_attention_slicing() + vae slicing/tiling on
     BOTH diffusion pipelines so no single pipeline tries to hold its full weights on GPU at once.
+
+Note on image model:
+  - FLUX.1-schnell became a gated Hugging Face model (requires login + accepted license),
+    which would need an extra manual HF token setup step. We use "stabilityai/sdxl-turbo"
+    instead - fully open, no login required, and lighter on VRAM (SDXL-sized vs FLUX's 12B).
 
 Note on TTS engine:
   - We intentionally do NOT use the separate "TTS"/"coqui-tts" packages. Their internal
@@ -53,7 +55,7 @@ import gc
 
 import torch
 import scipy.io.wavfile
-from diffusers import FluxPipeline, CogVideoXImageToVideoPipeline
+from diffusers import AutoPipelineForText2Image, CogVideoXImageToVideoPipeline
 from diffusers.utils import export_to_video, load_image
 from transformers import pipeline as hf_pipeline
 
@@ -93,7 +95,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     if device == "cpu":
-        print("WARNING: No GPU detected. Enable GPU T4 x2 in Kaggle kernel session settings.")
+        print("WARNING: No GPU detected.")
         raise RuntimeError("No GPU available - this pipeline requires a GPU kernel.")
 
     gpu_name = torch.cuda.get_device_name(0)
@@ -102,41 +104,40 @@ def main():
     if "P100" in gpu_name:
         raise RuntimeError(
             "This kernel is running on a P100, which is incompatible with the current "
-            "PyTorch build (dropped sm_60 support). Open this kernel in the Kaggle "
-            "editor and switch Accelerator to 'GPU T4 x2' in session settings, then re-run."
+            "PyTorch build (dropped sm_60 support). Check machine_shape in orchestrator.py."
         )
 
-    print("Loading FLUX.1-schnell for reference images (memory-optimized)...")
-    flux = FluxPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-schnell", torch_dtype=DTYPE
+    print("Loading SDXL-Turbo for reference images (open, ungated, memory-optimized)...")
+    img_pipe = AutoPipelineForText2Image.from_pretrained(
+        "stabilityai/sdxl-turbo", torch_dtype=DTYPE, variant="fp16"
     )
-    flux.enable_model_cpu_offload()
-    flux.enable_attention_slicing()
-    flux.vae.enable_slicing()
-    flux.vae.enable_tiling()
+    img_pipe.enable_model_cpu_offload()
+    img_pipe.enable_attention_slicing()
+    img_pipe.vae.enable_slicing()
+    img_pipe.vae.enable_tiling()
 
     krishna_ref_path = f"{WORKDIR}/krishna_ref.png"
     baby_ref_path = f"{WORKDIR}/baby_ref.png"
 
-    krishna_img = flux(
+    krishna_img = img_pipe(
         "Lord Krishna, blue-skinned deity, peacock feather crown, yellow silk dhoti, "
         "playing a flute, serene expression, soft divine lighting, front-facing portrait, "
         "highly detailed digital painting style",
-        num_inference_steps=4, guidance_scale=0.0,
+        num_inference_steps=2, guidance_scale=0.0,
         height=512, width=512,
     ).images[0]
     krishna_img.save(krishna_ref_path)
 
-    baby_img = flux(
+    baby_img = img_pipe(
         "A happy chubby baby, warm golden lighting, sitting pose, front-facing portrait, "
         "soft skin texture, wearing simple traditional Indian baby clothes, "
         "highly detailed digital painting style",
-        num_inference_steps=4, guidance_scale=0.0,
+        num_inference_steps=2, guidance_scale=0.0,
         height=512, width=512,
     ).images[0]
     baby_img.save(baby_ref_path)
 
-    del flux
+    del img_pipe
     free_gpu()
 
     scenes = split_into_scenes(PROMPT, NUM_SCENES)
@@ -189,7 +190,6 @@ def main():
     del tts_pipe
     free_gpu()
 
-    # Pitch/speed shift for a distinct narration voice
     shifted_narration = f"{WORKDIR}/narration_shifted.wav"
     subprocess.run([
         "ffmpeg", "-y", "-i", narration_path,
