@@ -14,13 +14,18 @@ Pipeline:
 
 Kaggle settings required:
   - Accelerator: GPU T4 x1
-  - Internet: ON (to download model weights and pip packages)
+  - Internet: ON (requires phone verification on your Kaggle account)
   - Add this as a "Script" kernel so it can run headless via `kaggle kernels push`.
 
 Notes on T4 (16GB VRAM) memory management:
   - Uses float16 (not bfloat16) - T4 is a Turing GPU without proper bf16 tensor core support.
   - Uses enable_model_cpu_offload() + enable_attention_slicing() + vae slicing/tiling on
     BOTH pipelines so no single pipeline tries to hold its full weights on GPU at once.
+
+Note on the TTS package:
+  - The original PyPI package "TTS" (Coqui) is abandoned and capped at Python <3.12.
+  - Kaggle's current image runs Python 3.12, so we install the maintained fork
+    "coqui-tts" instead. It keeps the same `from TTS.api import TTS` import path.
 """
 
 import subprocess
@@ -30,7 +35,7 @@ print("Installing/upgrading required packages...")
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q", "-U",
      "diffusers>=0.31.0", "transformers>=4.44.0", "accelerate>=0.33.0",
-     "TTS", "imageio-ffmpeg", "sentencepiece", "protobuf"],
+     "coqui-tts", "imageio-ffmpeg", "sentencepiece", "protobuf"],
     check=True
 )
 
