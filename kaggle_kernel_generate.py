@@ -1,0 +1,161 @@
+"""
+kaggle_kernel_generate.py
+Runs INSIDE a Kaggle Notebook (GPU: T4 x1 or P100 recommended).
+Generates a ~60s mythological video: Lord Krishna + a baby, from one text prompt.
+
+Pipeline:
+  1. Generate two reference images (Krishna, baby) with FLUX.1-schnell.
+  2. Split the user prompt into N scenes with a small local LLM.
+  3. For each scene, generate a 6-10s clip with CogVideoX-5B-I2V, conditioned
+     on the reference images so characters stay visually consistent.
+  4. Generate narration audio with Coqui XTTS-v2 (voice tweaked via speed/pitch).
+  5. Stitch everything with ffmpeg into output.mp4 (Kaggle kernel output).
+
+Kaggle settings required:
+  - Accelerator: GPU T4 x1 (or P100)
+  - Internet: ON (to download model weights first run; cache after)
+  - Add this as a "Script" kernel, not just a notebook, so it can run headless
+    via `kaggle kernels push`.
+
+Environment variable read at runtime (set via Kaggle kernel metadata "SCENE_PROMPT"
+or edit PROMPT below before pushing):
+"""
+
+import os
+import json
+import subprocess
+import textwrap
+
+import torch
+from diffusers import FluxPipeline, CogVideoXImageToVideoPipeline
+from diffusers.utils import export_to_video, load_image
+from TTS.api import TTS
+
+PROMPT = os.environ.get(
+    "SCENE_PROMPT",
+    "Krishna playing a flute in a moonlit forest while a baby crawls toward him laughing"
+)
+NUM_SCENES = 6          # 6 scenes x ~10s = ~60s total
+CLIP_SECONDS = 10
+FPS = 8
+WORKDIR = "/kaggle/working"
+os.makedirs(WORKDIR, exist_ok=True)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# ---------- 1. Reference images (character consistency anchor) ----------
+print("Loading FLUX.1-schnell for reference images...")
+flux = FluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16
+).to(device)
+
+krishna_ref_path = f"{WORKDIR}/krishna_ref.png"
+baby_ref_path = f"{WORKDIR}/baby_ref.png"
+
+krishna_img = flux(
+    "Lord Krishna, blue-skinned deity, peacock feather crown, yellow silk dhoti, "
+    "playing a flute, serene expression, soft divine lighting, front-facing portrait, "
+    "highly detailed digital painting style",
+    num_inference_steps=4, guidance_scale=0.0
+).images[0]
+krishna_img.save(krishna_ref_path)
+
+baby_img = flux(
+    "A happy chubby baby, warm golden lighting, sitting pose, front-facing portrait, "
+    "soft skin texture, wearing simple traditional Indian baby clothes, "
+    "highly detailed digital painting style",
+    num_inference_steps=4, guidance_scale=0.0
+).images[0]
+baby_img.save(baby_ref_path)
+
+del flux
+torch.cuda.empty_cache()
+
+# ---------- 2. Scene split (simple rule-based; swap for a local LLM call if you have one) ----------
+def split_into_scenes(prompt: str, n: int) -> list[str]:
+    base = prompt.strip().rstrip(".")
+    beats = [
+        f"Opening shot: {base}, wide establishing view",
+        f"{base}, close-up on Krishna's face, gentle smile",
+        f"{base}, close-up on the baby reacting joyfully",
+        f"{base}, medium shot showing both characters together",
+        f"{base}, dramatic lighting shift, divine glow intensifies",
+        f"Closing shot: {base}, camera slowly pulls back, peaceful ending",
+    ]
+    return beats[:n] if n <= len(beats) else (beats * ((n // len(beats)) + 1))[:n]
+
+scenes = split_into_scenes(PROMPT, NUM_SCENES)
+print("Scenes:", json.dumps(scenes, indent=2))
+
+# ---------- 3. Video generation per scene (CogVideoX-5B Image-to-Video) ----------
+print("Loading CogVideoX-5B-I2V...")
+video_pipe = CogVideoXImageToVideoPipeline.from_pretrained(
+    "THUDM/CogVideoX-5b-I2V", torch_dtype=torch.bfloat16
+).to(device)
+video_pipe.enable_model_cpu_offload()
+video_pipe.vae.enable_tiling()
+
+clip_paths = []
+for i, scene_prompt in enumerate(scenes):
+    ref_image = load_image(krishna_ref_path if i % 2 == 0 else baby_ref_path)
+    print(f"Generating scene {i+1}/{len(scenes)}: {scene_prompt}")
+    frames = video_pipe(
+        prompt=scene_prompt,
+        image=ref_image,
+        num_videos_per_prompt=1,
+        num_inference_steps=30,
+        num_frames=CLIP_SECONDS * FPS,
+        guidance_scale=6.0,
+    ).frames[0]
+    clip_path = f"{WORKDIR}/scene_{i:02d}.mp4"
+    export_to_video(frames, clip_path, fps=FPS)
+    clip_paths.append(clip_path)
+
+del video_pipe
+torch.cuda.empty_cache()
+
+# ---------- 4. Narration with Coqui XTTS-v2 (free, unlimited, local) ----------
+print("Loading XTTS-v2 for narration...")
+tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+
+narration_text = (
+    f"{PROMPT}. In the gentle glow of dusk, the divine and the innocent came together, "
+    "a moment of pure devotion and joy."
+)
+narration_path = f"{WORKDIR}/narration.wav"
+tts.tts_to_file(
+    text=narration_text,
+    speaker_wav=None,          # supply a reference wav here to clone a specific voice
+    language="en",
+    file_path=narration_path,
+    speed=0.95,                # slight speed change = "voice change" effect
+)
+
+# Pitch-shift slightly with ffmpeg for further voice variation
+shifted_narration = f"{WORKDIR}/narration_shifted.wav"
+subprocess.run([
+    "ffmpeg", "-y", "-i", narration_path,
+    "-af", "asetrate=44100*0.97,aresample=44100,atempo=1.03",
+    shifted_narration
+], check=True)
+
+# ---------- 5. Assemble final video with ffmpeg ----------
+concat_list_path = f"{WORKDIR}/concat_list.txt"
+with open(concat_list_path, "w") as f:
+    for p in clip_paths:
+        f.write(f"file '{p}'\n")
+
+silent_full_path = f"{WORKDIR}/full_silent.mp4"
+subprocess.run([
+    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+    "-i", concat_list_path, "-c", "copy", silent_full_path
+], check=True)
+
+final_output = f"{WORKDIR}/output.mp4"
+subprocess.run([
+    "ffmpeg", "-y", "-i", silent_full_path, "-i", shifted_narration,
+    "-c:v", "copy", "-c:a", "aac", "-shortest", final_output
+], check=True)
+
+print(f"Done. Final video at: {final_output}")

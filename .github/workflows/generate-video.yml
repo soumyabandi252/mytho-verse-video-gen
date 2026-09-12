@@ -1,0 +1,50 @@
+name: Generate Mythology Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Describe the scene (Krishna + baby video, any prompt)"
+        required: true
+        default: "Krishna and a baby playing near the river at sunset"
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240   # Kaggle free GPU runs can take a while; generous ceiling
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Configure Kaggle credentials
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          mkdir -p ~/.kaggle
+          echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Run orchestrator (push job, wait, pull video)
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          python orchestrator.py \
+            --prompt "${{ github.event.inputs.prompt }}" \
+            --kaggle-user "$KAGGLE_USERNAME" \
+            --slug "mythoverse-video-gen"
+
+      - name: Upload final video as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mythoverse-video
+          path: output/output.mp4
