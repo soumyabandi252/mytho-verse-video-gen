@@ -7,8 +7,9 @@ Pipeline:
   1. Install/upgrade required packages (Kaggle's base image is often outdated/missing them).
   2. Generate two reference images (Krishna, baby) with SDXL-Turbo (open, ungated, T4-light).
   3. Split the user prompt into N scenes.
-  4. For each scene, generate a 6-10s clip with CogVideoX-5B-I2V, conditioned
-     on the reference images so characters stay visually consistent.
+  4. For each scene, animate a reference image into a ~4s clip with Stable Video Diffusion
+     (img2vid-xt), alternating between the Krishna and baby reference images so both
+     characters stay visually consistent across the whole video.
   5. Generate narration audio with a transformers-native TTS model (facebook/mms-tts-eng),
      with a pitch/speed shift applied afterward for a distinct voice.
   6. Stitch everything with ffmpeg into output.mp4 (Kaggle kernel output).
@@ -18,31 +19,32 @@ Kaggle settings required:
   - Internet: ON (requires phone verification on your Kaggle account).
   - Kernel type: "Script", so it runs headless via `kaggle kernels push`.
 
+IMPORTANT - why CogVideoX-5B was replaced with Stable Video Diffusion:
+  CogVideoX-5B-I2V ships a 4.7B-parameter T5-XXL text encoder plus a 5B video transformer.
+  Even with fp16 weights and low_cpu_mem_usage, loading its checkpoint shards into host
+  RAM before GPU offload consistently exceeded Kaggle's free-tier ~13GB RAM limit and got
+  the process OS-killed (twice, confirmed via logs, including after the fp16 variant
+  request silently fell back to full-size weights since no fp16 variant is published for
+  that repo). Stable Video Diffusion (img2vid-xt) is roughly 8x smaller, is natively an
+  image-to-video model (a natural fit for animating our reference images), and is one of
+  the most widely used models specifically proven to run on free Kaggle T4 kernels.
+
 Notes on T4 (16GB VRAM) memory management:
   - Uses float16 (not bfloat16) - T4 is a Turing GPU without proper bf16 tensor core support.
-  - Uses enable_model_cpu_offload() + enable_attention_slicing() + vae slicing/tiling on
-    BOTH diffusion pipelines so no single pipeline tries to hold its full weights on GPU at once.
-
-Notes on HOST RAM (not VRAM) for CogVideoX:
-  - CogVideoX-5b-I2V ships a 4.7B-parameter T5-XXL text encoder plus a 5B transformer.
-    Loading these at default (often fp32-stored) precision into CPU RAM before any GPU
-    offload happens can exceed Kaggle's ~13GB host RAM limit, causing the OS to kill the
-    process ("Killed" in logs, not a Python traceback). We fix this by requesting the
-    "fp16" variant explicitly (half the memory footprint) with a safe fallback to default
-    weights if that variant isn't published for this repo, and by using low_cpu_mem_usage.
+  - Uses enable_model_cpu_offload() + vae slicing/tiling so pipelines don't hold their full
+    weights on GPU at once.
 
 Note on image model:
   - FLUX.1-schnell became a gated Hugging Face model (requires login + accepted license),
     which would need an extra manual HF token setup step. We use "stabilityai/sdxl-turbo"
-    instead - fully open, no login required, and lighter on VRAM (SDXL-sized vs FLUX's 12B).
+    instead - fully open, no login required, and lighter on VRAM.
 
 Note on TTS engine:
   - We intentionally do NOT use the separate "TTS"/"coqui-tts" packages. Their internal
     code depends on specific transformers internals that conflict with the newer
-    transformers version diffusers/CogVideoX requires (import errors like
+    transformers version diffusers requires (import errors like
     "cannot import name isin_mps_friendly"). Using transformers' own TTS pipeline
-    (facebook/mms-tts-eng) avoids that whole class of dependency conflicts since it
-    shares the same transformers install as the video pipeline.
+    (facebook/mms-tts-eng) avoids that whole class of dependency conflicts.
 """
 
 import subprocess
@@ -63,7 +65,7 @@ import gc
 
 import torch
 import scipy.io.wavfile
-from diffusers import AutoPipelineForText2Image, CogVideoXImageToVideoPipeline
+from diffusers import AutoPipelineForText2Image, StableVideoDiffusionPipeline
 from diffusers.utils import export_to_video, load_image
 from transformers import pipeline as hf_pipeline
 
@@ -71,9 +73,9 @@ PROMPT = os.environ.get(
     "SCENE_PROMPT",
     "Krishna playing a flute in a moonlit forest while a baby crawls toward him laughing"
 )
-NUM_SCENES = 6          # 6 scenes x ~10s = ~60s total
-CLIP_SECONDS = 10
-FPS = 8
+NUM_SCENES = 15         # 15 clips x ~4s (25 frames @ 6fps) = ~60s total
+SVD_NUM_FRAMES = 25
+SVD_FPS = 6
 WORKDIR = "/kaggle/working"
 os.makedirs(WORKDIR, exist_ok=True)
 
@@ -84,35 +86,6 @@ def free_gpu():
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
-
-
-def load_cogvideox_low_ram():
-    """Load CogVideoX-5b-I2V with the smallest possible host-RAM footprint.
-    Tries the fp16 variant first (half the RAM/disk of default weights);
-    falls back to default weights if that variant isn't published."""
-    common_kwargs = dict(torch_dtype=DTYPE, low_cpu_mem_usage=True, use_safetensors=True)
-    try:
-        return CogVideoXImageToVideoPipeline.from_pretrained(
-            "THUDM/CogVideoX-5b-I2V", variant="fp16", **common_kwargs
-        )
-    except Exception as e:
-        print(f"fp16 variant unavailable ({e}); falling back to default weights.")
-        return CogVideoXImageToVideoPipeline.from_pretrained(
-            "THUDM/CogVideoX-5b-I2V", **common_kwargs
-        )
-
-
-def split_into_scenes(prompt: str, n: int) -> list:
-    base = prompt.strip().rstrip(".")
-    beats = [
-        f"Opening shot: {base}, wide establishing view",
-        f"{base}, close-up on Krishna's face, gentle smile",
-        f"{base}, close-up on the baby reacting joyfully",
-        f"{base}, medium shot showing both characters together",
-        f"{base}, dramatic lighting shift, divine glow intensifies",
-        f"Closing shot: {base}, camera slowly pulls back, peaceful ending",
-    ]
-    return beats[:n] if n <= len(beats) else (beats * ((n // len(beats)) + 1))[:n]
 
 
 def main():
@@ -136,7 +109,6 @@ def main():
         "stabilityai/sdxl-turbo", torch_dtype=DTYPE, variant="fp16", low_cpu_mem_usage=True
     )
     img_pipe.enable_model_cpu_offload()
-    img_pipe.enable_attention_slicing()
     img_pipe.vae.enable_slicing()
     img_pipe.vae.enable_tiling()
 
@@ -148,7 +120,7 @@ def main():
         "playing a flute, serene expression, soft divine lighting, front-facing portrait, "
         "highly detailed digital painting style",
         num_inference_steps=2, guidance_scale=0.0,
-        height=512, width=512,
+        height=576, width=1024,
     ).images[0]
     krishna_img.save(krishna_ref_path)
 
@@ -157,7 +129,7 @@ def main():
         "soft skin texture, wearing simple traditional Indian baby clothes, "
         "highly detailed digital painting style",
         num_inference_steps=2, guidance_scale=0.0,
-        height=512, width=512,
+        height=576, width=1024,
     ).images[0]
     baby_img.save(baby_ref_path)
 
@@ -165,30 +137,27 @@ def main():
     free_gpu()
     gc.collect()
 
-    scenes = split_into_scenes(PROMPT, NUM_SCENES)
-    print("Scenes:", json.dumps(scenes, indent=2))
-
-    print("Loading CogVideoX-5B-I2V (low host-RAM mode)...")
-    video_pipe = load_cogvideox_low_ram()
+    print("Loading Stable Video Diffusion (img2vid-xt, T4-light)...")
+    video_pipe = StableVideoDiffusionPipeline.from_pretrained(
+        "stabilityai/stable-video-diffusion-img2vid-xt",
+        torch_dtype=DTYPE, variant="fp16", low_cpu_mem_usage=True
+    )
     video_pipe.enable_model_cpu_offload()
-    video_pipe.enable_attention_slicing()
-    video_pipe.vae.enable_slicing()
-    video_pipe.vae.enable_tiling()
 
     clip_paths = []
-    for i, scene_prompt in enumerate(scenes):
-        ref_image = load_image(krishna_ref_path if i % 2 == 0 else baby_ref_path)
-        print(f"Generating scene {i+1}/{len(scenes)}: {scene_prompt}")
+    for i in range(NUM_SCENES):
+        ref_path = krishna_ref_path if i % 2 == 0 else baby_ref_path
+        ref_image = load_image(ref_path).resize((1024, 576))
+        print(f"Generating scene {i+1}/{NUM_SCENES} from {os.path.basename(ref_path)}")
         frames = video_pipe(
-            prompt=scene_prompt,
-            image=ref_image,
-            num_videos_per_prompt=1,
-            num_inference_steps=25,
-            num_frames=CLIP_SECONDS * FPS,
-            guidance_scale=6.0,
+            ref_image,
+            num_frames=SVD_NUM_FRAMES,
+            decode_chunk_size=8,
+            motion_bucket_id=110,
+            noise_aug_strength=0.02,
         ).frames[0]
         clip_path = f"{WORKDIR}/scene_{i:02d}.mp4"
-        export_to_video(frames, clip_path, fps=FPS)
+        export_to_video(frames, clip_path, fps=SVD_FPS)
         clip_paths.append(clip_path)
         free_gpu()
 
