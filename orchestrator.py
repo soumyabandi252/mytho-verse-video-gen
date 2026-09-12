@@ -14,6 +14,11 @@ Usage:
   python orchestrator.py --prompt "Krishna and a baby playing near the river at sunset" \
                           --kaggle-user your_kaggle_username \
                           --slug mythoverse-video-gen
+
+Important: The Kaggle CLI does NOT inherit the accelerator you pick in the web UI
+when pushing headlessly. The "machine_shape": "NvidiaTeslaT4" field below is what
+actually forces a T4 GPU instead of Kaggle's default P100 assignment. This must be
+present in kernel-metadata.json on every single push, not just set once in the UI.
 """
 
 import argparse
@@ -42,6 +47,7 @@ def build_kernel_folder(work_dir: Path, kaggle_user: str, slug: str, prompt: str
         "is_private": True,
         "enable_gpu": True,
         "enable_internet": True,
+        "machine_shape": "NvidiaTeslaT4",
         "dataset_sources": [],
         "competition_sources": [],
         "kernel_sources": [],
